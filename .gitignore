@@ -1,6 +1,12 @@
-data/
+# Big data files
+data/raw/
+data/processed/
 *.h5
 *.hdf5
 *.pt
 *.pth
+
+
+
+*.vscode
 __pycache__/
