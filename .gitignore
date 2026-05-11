@@ -7,6 +7,6 @@ data/processed/
 *.pth
 
 
-
+*.claude
 *.vscode
 __pycache__/
