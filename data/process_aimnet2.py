@@ -30,25 +30,32 @@ Pipeline:
        If charge is added as a model input in the future, this filter should be
        revisited — charged molecules can then be included without ambiguity.
 
-  3. Energy filter   — keep energy/atom within [E_MIN, E_MAX] (Ha/atom)
-                       removes corrupted DFT entries (e.g. S2 dimer at -10836 Ha/atom,
-                       which is ~27x below the physical S atomic energy of -398 Ha)
+  3. Energy filter   — keep energy/atom within [E_MIN, E_MAX] (eV/atom)
+                       removes corrupted DFT entries. Raw AIMNet2 energies are
+                       stored in eV (total DFT energy), not Hartree.
+                       Typical range: H ~-13.6 eV/atom, S ~-10826 eV/atom.
+                       Filter bounds chosen to reject corrupted outliers.
 
   4. Force filter    — drop conformers with any |F| > MAX_FORCE (eV/Å)
                        0.024% of atom-frames exceed 20 eV/Å; these dominate MSE
                        loss (scales as |F|²) without representing polymer-relevant
                        chemistry at 300K
 
-  5. Atomization     — subtract per-element reference energies (Ha) then convert to eV
-                       raw DFT total energies (~10³ Ha) are not model-learnable;
-                       atomization energies (~1–100 eV) are
+  5. Atomization     — subtract per-element reference energies (eV) to obtain
+                       atomization energies (~1–100 eV range, model-learnable).
+                       Raw total DFT energies (~10³ eV) are stored as-is; refs
+                       are converted from Ha to eV before subtraction.
 
-  6. Unit conversion — energy Ha -> eV; forces already eV/Å; coords stay Å
+  6. Units           — energy already eV; forces already eV/Å; coords stay Å
 
 Output: processed/aimnet2_processed.h5
   Same group structure as input (keyed by zero-padded atom count).
-  New dataset 'energy_atomization' (eV) added alongside original 'energy' (Ha).
+  New dataset 'energy_atomization' (eV) added alongside original 'energy' (eV).
   Only groups with at least one passing conformer are written.
+
+NOTE: Raw AIMNet2 h5 stores total DFT energies in eV (confirmed by cross-checking
+ClF group '002': raw ≈ -15240 eV matches Cl+F reference (-460-100 Ha × 27.211).
+Reference energies below are in Ha and converted to eV inside compute_atomization.
 
 Reference energies: wB97M-D3(BJ)/def2-TZVPP spin-averaged atomic energies (Ha).
 Source: AIMNet2 paper (Anstine et al., JCTC 2023) + standard atomic calculations.
@@ -69,9 +76,9 @@ OUTPUT = Path("processed/aimnet2_processed.h5")
 ALLOWED_Z  = frozenset([1, 6, 7, 8, 9, 14, 15, 16, 17, 35])
 #                       H  C  N  O  F  Si   P   S  Cl  Br
 MAX_CHARGE = 0   # neutral only — see module docstring for full rationale
-MAX_FORCE  = 20.0   # eV/Å — p99.9 of dataset is 26.5, max is 96.7
-E_MIN      = -1000.0  # Ha/atom  (CHONS range: H~-0.5, S~-398)
-E_MAX      = -0.4     # Ha/atom  (just below H atomic energy)
+MAX_FORCE  = 20.0    # eV/Å — p99.9 of dataset is 26.5, max is 96.7
+E_MIN      = -30000.0  # eV/atom  (S atomic energy ≈ -10826 eV/atom; generous lower bound)
+E_MAX      = -10.0     # eV/atom  (H atomic energy ≈ -13.6 eV/atom; reject near-zero outliers)
 
 # ── Atomization reference energies (Ha) — wB97M-D3(BJ)/def2-TZVPP ───────
 REFERENCE_ENERGIES = {
@@ -95,17 +102,20 @@ ELEM_SYMBOL = {
 }
 
 
-def compute_atomization(energy_ha: np.ndarray, numbers: np.ndarray) -> np.ndarray:
+def compute_atomization(energy_ev: np.ndarray, numbers: np.ndarray) -> np.ndarray:
     """
-    energy_ha : (N_conf,)          total DFT energies in Hartree
+    energy_ev : (N_conf,)          total DFT energies in eV (raw AIMNet2 unit)
     numbers   : (N_conf, n_atoms)  atomic numbers
     returns   : (N_conf,)          atomization energies in eV
+
+    Reference energies are defined in Ha and converted to eV here so the
+    subtraction is eV - eV (no HA_TO_EV multiplication on the result).
     """
-    ref = np.array([
-        sum(REFERENCE_ENERGIES[int(z)] for z in numbers[i])
-        for i in range(len(energy_ha))
+    ref_ev = np.array([
+        sum(REFERENCE_ENERGIES[int(z)] * HA_TO_EV for z in numbers[i])
+        for i in range(len(energy_ev))
     ])
-    return (energy_ha - ref) * HA_TO_EV
+    return energy_ev - ref_ev
 
 
 def build_elem_mask(numbers: np.ndarray) -> np.ndarray:
@@ -137,9 +147,9 @@ def process():
         fout.attrs["allowed_Z"]      = sorted(ALLOWED_Z)
         fout.attrs["max_charge"]     = MAX_CHARGE
         fout.attrs["max_force_evA"]  = MAX_FORCE
-        fout.attrs["e_min_ha_atom"]  = E_MIN
-        fout.attrs["e_max_ha_atom"]  = E_MAX
-        fout.attrs["energy_unit"]    = "eV (atomization)"
+        fout.attrs["e_min_ev_atom"]  = E_MIN
+        fout.attrs["e_max_ev_atom"]  = E_MAX
+        fout.attrs["energy_unit"]    = "eV (atomization, raw_energy_ev - ref_ev)"
         fout.attrs["force_unit"]     = "eV/Ang"
         fout.attrs["coord_unit"]     = "Ang"
 
@@ -150,7 +160,7 @@ def process():
 
             numbers = grp["numbers"][:]   # (N, n_atoms)  int8
             charges = grp["charge"][:]    # (N,)          int8
-            energy  = grp["energy"][:]    # (N,)          float64  Ha
+            energy  = grp["energy"][:]    # (N,)          float64  eV (raw AIMNet2 unit)
             forces  = grp["forces"][:]    # (N, n_atoms, 3) float32 eV/Å
 
             n_atoms = int(g)
@@ -200,7 +210,7 @@ def process():
             for key in ["coord", "forces", "numbers", "charge", "charges", "dipole", "quadrupole"]:
                 out.create_dataset(key, data=grp[key][:][keep], **kw)
 
-            # energy: keep original Ha for reference, add atomization in eV
+            # energy: keep original eV total energy for reference, add atomization in eV
             out.create_dataset("energy",              data=energy[keep],   **kw)
             out.create_dataset("energy_atomization",  data=e_atomization,  **kw)
 
