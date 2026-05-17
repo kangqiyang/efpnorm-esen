@@ -48,7 +48,7 @@ CKPT_PATH = _ROOT / (
     "checkpoints/esen_sm_conserving_all.pt"
 )
 
-DATA_DIR = Path("/nethome/kyang394/scratch/mlff/eafm-polyget/data/asedb")
+DATA_DIR = Path(__file__).parent.parent / "data" / "asedb"
 
 DATASETS = ["aimnet2", "spice2", "qdpi", "ani2x", "spf"]
 

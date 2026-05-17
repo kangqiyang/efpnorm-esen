@@ -42,7 +42,7 @@ warnings.filterwarnings("ignore")
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 _ROOT   = Path(__file__).parent.parent
-DATA_DIR = Path("/nethome/kyang394/scratch/mlff/eafm-polyget/data/asedb")
+DATA_DIR = _ROOT / "data" / "asedb"
 DATASETS = ["aimnet2", "spice2", "qdpi", "ani2x", "spf"]
 
 # ── Config ────────────────────────────────────────────────────────────────────
