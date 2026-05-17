@@ -1,2 +1,1 @@
-from .polyget import PolyGET
-from .efpnorm import EFPNorm
+from .efpnorm import EFPNorm, EquivariantEFPNorm
