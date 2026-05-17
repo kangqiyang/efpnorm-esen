@@ -1,10 +1,15 @@
 # Big data files
 data/raw/
 data/processed/
+data/asedb/
 *.h5
 *.hdf5
+*.db
 *.pt
 *.pth
+
+# Scratch / runtime artifacts
+scratch/
 
 
 *.claude
