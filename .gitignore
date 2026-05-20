@@ -16,3 +16,4 @@ scratch/
 *.vscode
 __pycache__/
 eval/md_runs/
+train/checkpoints/
