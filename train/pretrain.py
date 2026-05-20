@@ -17,6 +17,10 @@ Usage:
 """
 
 import argparse
+import csv
+import json
+import logging
+import re as _re
 import time
 import random
 import warnings
@@ -38,6 +42,17 @@ _sys.path.insert(0, str(Path(__file__).parent.parent))
 from model.efpnorm import EquivariantEFPNorm
 
 warnings.filterwarnings("ignore")
+
+from rich.console import Console
+from rich.progress import (
+    Progress, SpinnerColumn, BarColumn, TextColumn,
+    TimeElapsedColumn, MofNCompleteColumn,
+)
+from rich.panel import Panel
+from rich.rule import Rule
+from rich.table import Table
+
+console = Console(highlight=False)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -74,6 +89,7 @@ BACKBONE_CFG = dict(
     norm_type           = "rms_norm_sh",
     act_type            = "gate",
     chg_spin_emb_type   = "rand_emb",  # official eSEN-SM value (NOT "pos_emb")
+    cs_emb_grad         = True,        # official eSEN-SM value (NOT False)
     # ── conservative force settings ───────────────────────────────────────────
     direct_forces       = False,       # F = -∇E via autograd
     regress_forces      = True,
@@ -86,7 +102,7 @@ BACKBONE_CFG = dict(
 )
 
 CUTOFF     = BACKBONE_CFG["cutoff"]
-MAX_ATOMS  = 50
+MAX_ATOMS  = 100
 BATCH_SIZE = 8
 LR         = 4e-4      # standard from-scratch rate (fine-tuning uses 2e-5)
 EPOCHS     = 30
@@ -164,44 +180,103 @@ def replace_norms_with_efp(model: nn.Module) -> int:
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 
-class AseDbDataset(Dataset):
-    """Loads an ASE SQLite DB.
+def _row_to_tensors(row):
+    atoms = row.toatoms()
+    return (
+        torch.tensor(atoms.numbers.copy(),                          dtype=torch.long),
+        torch.tensor(atoms.positions.copy().astype(np.float32),     dtype=torch.float32),
+        torch.tensor(float(atoms.get_potential_energy()),           dtype=torch.float32),
+        torch.tensor(atoms.get_forces().copy().astype(np.float32),  dtype=torch.float32),
+    )
 
-    max_frames caps rows after the max_atoms filter — the loop breaks early
-    so large DBs never need to be fully scanned.
+
+class AseDbDataset(Dataset):
+    """Lazy-loading ASE SQLite dataset.
+
+    __init__ builds (or reloads from disk) a filtered index of row IDs by
+    scanning row.natoms — it never calls toatoms(), so startup is fast even
+    for tens of millions of frames.  The index is cached alongside the DB
+    as <stem>.idx_ma<max_atoms>.npy and invalidated by DB mtime.
+
+    Actual atom data is fetched on demand in __getitem__ via a per-worker
+    SQLite connection opened lazily on first access.  Each DataLoader worker
+    process gets its own independent handle, so concurrent reads are safe.
+
+    Set preload=True only for tiny smoke-test datasets; for large-scale
+    training the lazy path keeps RAM flat regardless of dataset size.
     """
     def __init__(self, db_path: Path, cutoff: float, max_atoms: int = MAX_ATOMS,
-                 max_frames: int | None = None):
+                 max_frames: int | None = None, preload: bool = False):
+        self.db_path   = db_path
         self.cutoff    = cutoff
         self.max_atoms = max_atoms
-        rows = []
-        with connect(str(db_path)) as db:
-            for row in db.select():
-                atoms = row.toatoms()
-                if len(atoms) <= max_atoms:
-                    rows.append((
-                        atoms.numbers.copy(),
-                        atoms.positions.copy().astype(np.float32),
-                        float(atoms.get_potential_energy()),
-                        atoms.get_forces().copy().astype(np.float32),
-                    ))
-                    if max_frames is not None and len(rows) >= max_frames:
-                        break
-        self.rows = rows
-        cap = f"/{max_frames}" if max_frames is not None else ""
-        print(f"[Dataset] {db_path.name}: {len(self.rows)}{cap} frames")
+        self.preload   = preload
+        self._conn     = None  # opened lazily; None prevents inheriting across fork
+
+        cache_path = db_path.parent / f"{db_path.stem}.idx_ma{max_atoms}.npy"
+        if cache_path.exists() and cache_path.stat().st_mtime >= db_path.stat().st_mtime:
+            row_ids = np.load(cache_path).tolist()
+            console.print(f"  [dim]cached index[/]  {db_path.name}  "
+                          f"[dim]({len(row_ids):,} rows before cap)[/]")
+        else:
+            row_ids = []
+            with connect(str(db_path)) as db:
+                total = db.count()
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn(f"  [cyan]indexing[/]  {db_path.name}"),
+                    BarColumn(bar_width=28),
+                    MofNCompleteColumn(),
+                    TimeElapsedColumn(),
+                    console=console, transient=True,
+                ) as prog:
+                    task = prog.add_task("", total=total)
+                    for row in db.select():
+                        if row.natoms <= max_atoms:
+                            row_ids.append(row.id)
+                        prog.advance(task)
+            np.save(cache_path, np.array(row_ids, dtype=np.int64))
+
+        if max_frames is not None:
+            row_ids = row_ids[:max_frames]
+        self.row_ids = row_ids
+
+        cap = f"/{max_frames:,}" if max_frames is not None else ""
+        console.print(f"  [green]✓[/] [bold]{db_path.name}[/]  "
+                      f"[cyan]{len(self.row_ids):,}[/][dim]{cap} frames[/]")
+
+        if preload:
+            conn = connect(str(db_path))
+            with Progress(
+                SpinnerColumn(),
+                TextColumn(f"  [yellow]preloading[/]  {db_path.name}"),
+                BarColumn(bar_width=28),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                console=console, transient=True,
+            ) as prog:
+                task = prog.add_task("", total=len(self.row_ids))
+                self._data = []
+                for rid in self.row_ids:
+                    self._data.append(_row_to_tensors(conn.get(id=rid)))
+                    prog.advance(task)
+            conn.close()
+
+    def __getstate__(self):
+        # Never pickle an open connection — each worker must open its own.
+        state = self.__dict__.copy()
+        state["_conn"] = None
+        return state
 
     def __len__(self):
-        return len(self.rows)
+        return len(self.row_ids)
 
     def __getitem__(self, idx):
-        Z, pos, E, F = self.rows[idx]
-        return (
-            torch.tensor(Z,   dtype=torch.long),
-            torch.tensor(pos, dtype=torch.float32),
-            torch.tensor(E,   dtype=torch.float32),
-            torch.tensor(F,   dtype=torch.float32),
-        )
+        if self.preload:
+            return self._data[idx]
+        if self._conn is None:
+            self._conn = connect(str(self.db_path))
+        return _row_to_tensors(self._conn.get(id=self.row_ids[idx]))
 
 
 def collate_fn(batch):
@@ -297,7 +372,8 @@ def loss_fn(pred: dict, data: AtomicData, device: str) -> torch.Tensor:
 
 # ── Train / Eval ──────────────────────────────────────────────────────────────
 
-def run_epoch(model, loader, optimizer, device, train: bool):
+def run_epoch(model, loader, optimizer, device, train: bool,
+              progress=None, task_id=None):
     model.train(train)
     total_loss = total_fmae = total_steps = 0
 
@@ -330,8 +406,71 @@ def run_epoch(model, loader, optimizer, device, train: bool):
             total_loss  += loss.item()
             total_fmae  += f_mae
             total_steps += 1
+            if progress is not None:
+                progress.advance(task_id)
 
     return total_loss / total_steps, total_fmae / total_steps
+
+
+# ── Experiment logging ────────────────────────────────────────────────────────
+
+def _make_run_name(args) -> str:
+    mantissa, exp = f"{args.lr:.0e}".split("e")
+    lr_str = f"{mantissa}e{int(exp)}"
+    norm   = "rmsnorm" if args.no_efp_norm else "efpnorm"
+    return f"{args.dataset}_L{args.num_layers}C{args.sphere_channels}_{norm}_lr{lr_str}"
+
+
+def _setup_file_log(log_path: Path) -> logging.Logger:
+    logger = logging.getLogger("pretrain")
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        fh = logging.FileHandler(log_path, mode="a")
+        fh.setFormatter(logging.Formatter("%(asctime)s  %(message)s",
+                                          datefmt="%Y-%m-%d %H:%M:%S"))
+        logger.addHandler(fh)
+    return logger
+
+
+def _save_config(ckpt_dir: Path, args, cfg: dict, run_name: str) -> None:
+    config = {
+        "run_name":         run_name,
+        "dataset":          args.dataset,
+        "lr":               args.lr,
+        "epochs":           args.epochs,
+        "batch_size":       args.batch_size,
+        "num_layers":       args.num_layers,
+        "sphere_channels":  args.sphere_channels,
+        "hidden_channels":  cfg["hidden_channels"],
+        "edge_channels":    cfg["edge_channels"],
+        "efp_norm":         not args.no_efp_norm,
+        "max_train_frames": args.max_train_frames,
+        "max_val_frames":   args.max_val_frames,
+        "num_workers":      args.num_workers,
+        "seed":             SEED,
+        "backbone_cfg":     dict(cfg),
+    }
+    with open(ckpt_dir / "config.json", "w") as f:
+        json.dump(config, f, indent=2)
+
+
+_METRICS_COLS = ["epoch", "train_loss", "train_fmae", "val_loss", "val_fmae",
+                 "lr", "epoch_time_sec", "best_val_fmae"]
+
+
+def _append_metrics(ckpt_dir: Path, row: dict) -> None:
+    path   = ckpt_dir / "metrics.csv"
+    is_new = not path.exists()
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_METRICS_COLS)
+        if is_new:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def _save_summary(ckpt_dir: Path, summary: dict) -> None:
+    with open(ckpt_dir / "summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -342,14 +481,20 @@ def build_datasets(args):
     for name in names:
         tr_db = DATA_DIR / f"{name}_train.db"
         va_db = DATA_DIR / f"{name}_val.db"
-        if not tr_db.exists():
-            print(f"[{name}] SKIP — {tr_db} not found")
+        if not tr_db.exists() or not va_db.exists():
+            _skip_dataset(name, tr_db if not tr_db.exists() else va_db)
             continue
         train_list.append(AseDbDataset(tr_db, CUTOFF, max_atoms=args.max_atoms,
-                                       max_frames=args.max_train_frames))
+                                       max_frames=args.max_train_frames,
+                                       preload=args.preload_data))
         val_list.append(AseDbDataset(va_db, CUTOFF, max_atoms=args.max_atoms,
-                                     max_frames=args.max_val_frames))
+                                     max_frames=args.max_val_frames,
+                                     preload=args.preload_data))
     return train_list, val_list
+
+
+def _skip_dataset(name: str, path: Path) -> None:
+    console.print(f"  [dim][{name}] SKIP — {path} not found[/]")
 
 
 class ConcatDataset(torch.utils.data.ConcatDataset):
@@ -364,13 +509,17 @@ def main():
     parser.add_argument("--lr",           type=float, default=LR)
     parser.add_argument("--max_atoms",    type=int,   default=MAX_ATOMS)
     parser.add_argument("--resume",       type=str,   default=None,
-                        help="Resume from a previous pretrain checkpoint")
+                        help="Resume from checkpoint dir (uses latest.pt) or a specific .pt file")
     parser.add_argument("--out",          type=str,   default=None,
-                        help="Output checkpoint path (default: scratch/pretrain_<dataset>.pt)")
+                        help="Checkpoint directory (default: train/checkpoints/pretrain_<dataset>)")
     parser.add_argument("--no_efp_norm",  action="store_true",
                         help="Disable EFPNorm (use original EquivariantRMSNorm)")
     parser.add_argument("--max_train_frames", type=int, default=None)
     parser.add_argument("--max_val_frames",   type=int, default=None)
+    parser.add_argument("--preload_data",  action="store_true",
+                        help="Preload all frames into RAM (only for small smoke tests)")
+    parser.add_argument("--num_workers",   type=int,   default=4,
+                        help="DataLoader worker processes (0 = main process only)")
     # Architectural overrides — changing these produces a different model
     # that cannot load checkpoints from the default configuration.
     # hidden_channels and edge_channels default to None, which auto-couples
@@ -389,10 +538,18 @@ def main():
     hidden_channels = args.hidden_channels if args.hidden_channels is not None else args.sphere_channels
     edge_channels   = args.edge_channels   if args.edge_channels   is not None else args.sphere_channels
 
-    out_ckpt = Path(args.out) if args.out else _ROOT / "scratch" / f"pretrain_{args.dataset}.pt"
+    # ── Run directory ─────────────────────────────────────────────────────────
+    run_name = Path(args.out).name if args.out else _make_run_name(args)
+    ckpt_dir = Path(args.out) if args.out else _ROOT / "train" / "checkpoints" / run_name
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    best_ckpt   = ckpt_dir / "best.pt"
+    latest_ckpt = ckpt_dir / "latest.pt"
 
-    print(f"Device: {DEVICE}")
-    print(f"\nLoading datasets ...")
+    logger = _setup_file_log(ckpt_dir / "stdout.log")
+    logger.info(f"=== run={run_name} ===")
+
+    # ── Load data ─────────────────────────────────────────────────────────────
+    console.print(Rule("[dim]datasets[/]", style="dim"))
     train_list, val_list = build_datasets(args)
     if not train_list:
         raise RuntimeError("No datasets found")
@@ -400,12 +557,16 @@ def main():
     train_ds = ConcatDataset(train_list) if len(train_list) > 1 else train_list[0]
     val_ds   = ConcatDataset(val_list)   if len(val_list)   > 1 else val_list[0]
 
+    nw = 0 if args.preload_data else args.num_workers
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              collate_fn=collate_fn, num_workers=0)
+                              collate_fn=collate_fn, num_workers=nw,
+                              persistent_workers=nw > 0)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
-                              collate_fn=collate_fn, num_workers=0)
+                              collate_fn=collate_fn, num_workers=nw,
+                              persistent_workers=nw > 0)
 
-    print(f"\nBuilding eSEN from scratch ...")
+    # ── Build model ───────────────────────────────────────────────────────────
+    console.print(Rule("[dim]model[/]", style="dim"))
     cfg = {
         **BACKBONE_CFG,
         "num_layers":      args.num_layers,
@@ -413,25 +574,23 @@ def main():
         "hidden_channels": hidden_channels,
         "edge_channels":   edge_channels,
     }
-    print(f"  num_layers={cfg['num_layers']}  "
-          f"sphere/hidden/edge={cfg['sphere_channels']}/{cfg['hidden_channels']}/{cfg['edge_channels']}")
-    model = eSEN(cfg)
-
-    if not args.no_efp_norm:
-        n = replace_norms_with_efp(model)
-        print(f"  EFPNorm: replaced {n} EquivariantRMSNorm layers")
-
-    model = model.to(DEVICE)
+    n_replaced = 0
+    with console.status("[cyan]Building eSEN from scratch ...[/]", spinner="dots"):
+        model = eSEN(cfg)
+        if not args.no_efp_norm:
+            n_replaced = replace_norms_with_efp(model)
+        model = model.to(DEVICE)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"  {n_params/1e6:.1f}M parameters")
+    norm_str = (f"[green]EFPNorm[/] [dim]×{n_replaced}[/]"
+                if not args.no_efp_norm else "[dim]EquivariantRMSNorm[/]")
+    console.print(f"  [green]✓[/] layers=[bold]{cfg['num_layers']}[/]  "
+                  f"ch=[bold]{cfg['sphere_channels']}/{cfg['hidden_channels']}/{cfg['edge_channels']}[/]  "
+                  f"[dim]{n_params/1e6:.1f}M params[/]  {norm_str}")
 
-    start_epoch = 1
-    if args.resume:
-        state = torch.load(args.resume, map_location=DEVICE, weights_only=False)
-        model.load_state_dict(state["model"])
-        start_epoch = state["epoch"] + 1
-        print(f"  Resumed from epoch {state['epoch']}: {args.resume}")
+    # ── Save config ───────────────────────────────────────────────────────────
+    _save_config(ckpt_dir, args, cfg, run_name)
 
+    # ── Optimizer / scheduler ─────────────────────────────────────────────────
     # no_weight_decay() returns a set of parameter names whose norms/biases
     # should not be penalized. eSCNMDBackbone implements this.
     no_wd = set(model.backbone.no_weight_decay()) if hasattr(model.backbone, "no_weight_decay") else set()
@@ -449,34 +608,145 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=args.lr * 0.01,
     )
-    for _ in range(start_epoch - 1):
-        scheduler.step()
 
-    print(f"\nPretraining for {args.epochs} epochs (LR={args.lr:.2e}) ...")
+    start_epoch   = 1
     best_val_fmae = float("inf")
+    best_epoch    = 0
+    if args.resume:
+        resume_path = Path(args.resume)
+        if resume_path.is_dir():
+            resume_path = resume_path / "latest.pt"
+        state = torch.load(resume_path, map_location=DEVICE, weights_only=False)
+        model.load_state_dict(state["model"])
+        if "optimizer" in state:
+            optimizer.load_state_dict(state["optimizer"])
+        if "scheduler" in state:
+            scheduler.load_state_dict(state["scheduler"])
+        start_epoch   = state["epoch"] + 1
+        best_val_fmae = state.get("best_val_fmae", float("inf"))
+        best_epoch    = state.get("best_epoch", 0)
+        console.print(f"  [yellow]↑ resumed[/] epoch {state['epoch']}  "
+                      f"best F-MAE {best_val_fmae*1000:.1f} meV/Å  "
+                      f"[dim]{resume_path}[/]")
+        logger.info(f"resumed from epoch {state['epoch']}  "
+                    f"best_val_fmae={best_val_fmae:.6f}  path={resume_path}")
 
+    # ── Summary panel ─────────────────────────────────────────────────────────
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="dim", justify="right")
+    grid.add_column()
+    grid.add_row("run",          f"[bold]{run_name}[/]")
+    grid.add_row("dataset",      f"[bold]{args.dataset}[/]  "
+                                 f"[dim]{len(train_ds):,} train / {len(val_ds):,} val[/]")
+    grid.add_row("architecture", f"layers={cfg['num_layers']}  "
+                                 f"ch={cfg['sphere_channels']}/{cfg['hidden_channels']}/{cfg['edge_channels']}  "
+                                 f"[dim]{n_params/1e6:.1f}M params[/]")
+    grid.add_row("norm",         norm_str)
+    grid.add_row("training",     f"epochs={args.epochs}  lr={args.lr:.2e}  "
+                                 f"batch={args.batch_size}  workers={nw}")
+    grid.add_row("device",       f"[bold]{DEVICE}[/]")
+    grid.add_row("checkpoints",  f"[dim]{ckpt_dir}[/]")
+    console.print(Panel(grid, title="[bold blue]eSEN Pretraining[/]",
+                        border_style="blue", padding=(0, 1)))
+    logger.info(f"dataset={args.dataset}  epochs={args.epochs}  lr={args.lr}  "
+                f"batch={args.batch_size}  layers={cfg['num_layers']}  "
+                f"ch={cfg['sphere_channels']}  efp_norm={not args.no_efp_norm}  "
+                f"params={n_params/1e6:.1f}M  device={DEVICE}")
+
+    # ── Training loop ─────────────────────────────────────────────────────────
+    train_start = time.time()
+    w = len(str(args.epochs))
     for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
-        tr_loss, tr_fmae = run_epoch(model, train_loader, optimizer, DEVICE, train=True)
-        va_loss, va_fmae = run_epoch(model, val_loader,   optimizer, DEVICE, train=False)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=28),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console, transient=True,
+        ) as prog:
+            tr_task = prog.add_task(
+                f"[cyan]Epoch {epoch:{w}d}/{args.epochs} train[/]",
+                total=len(train_loader))
+            tr_loss, tr_fmae = run_epoch(
+                model, train_loader, optimizer, DEVICE, train=True,
+                progress=prog, task_id=tr_task)
+            va_task = prog.add_task(
+                f"[blue]Epoch {epoch:{w}d}/{args.epochs}   val[/]",
+                total=len(val_loader))
+            va_loss, va_fmae = run_epoch(
+                model, val_loader, optimizer, DEVICE, train=False,
+                progress=prog, task_id=va_task)
         scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
         dt = time.time() - t0
 
-        star = " *" if va_fmae < best_val_fmae else ""
-        if va_fmae < best_val_fmae:
+        improved = va_fmae < best_val_fmae
+        if improved:
             best_val_fmae = va_fmae
+            best_epoch    = epoch
             torch.save({"model": model.state_dict(), "epoch": epoch,
-                        "backbone_cfg": cfg}, out_ckpt)
+                        "backbone_cfg": cfg}, best_ckpt)
 
-        print(
-            f"Epoch {epoch:3d}/{args.epochs}  "
-            f"train loss={tr_loss:.4f}  F-MAE={tr_fmae*1000:.1f}meV/Å  |  "
-            f"val loss={va_loss:.4f}  F-MAE={va_fmae*1000:.1f}meV/Å  "
-            f"{dt:.1f}s{star}"
+        # Full state every epoch so --resume restores optimizer/scheduler momentum.
+        torch.save({
+            "model":         model.state_dict(),
+            "optimizer":     optimizer.state_dict(),
+            "scheduler":     scheduler.state_dict(),
+            "epoch":         epoch,
+            "best_val_fmae": best_val_fmae,
+            "best_epoch":    best_epoch,
+            "backbone_cfg":  cfg,
+        }, latest_ckpt)
+
+        _append_metrics(ckpt_dir, {
+            "epoch":          epoch,
+            "train_loss":     round(tr_loss,  6),
+            "train_fmae":     round(tr_fmae,  6),
+            "val_loss":       round(va_loss,  6),
+            "val_fmae":       round(va_fmae,  6),
+            "lr":             round(current_lr, 8),
+            "epoch_time_sec": round(dt, 1),
+            "best_val_fmae":  round(best_val_fmae, 6),
+        })
+
+        va_color = "bold green" if improved else "cyan"
+        star     = "  [bold green]★ best[/]" if improved else ""
+        console.print(
+            f"[dim]Epoch[/] [bold]{epoch:{w}d}[/][dim]/{args.epochs}[/]  "
+            f"[dim]train[/] {tr_loss:.4f} [yellow]{tr_fmae*1000:6.1f}[/][dim] meV/Å[/]  "
+            f"[dim]│  val[/] {va_loss:.4f} [{va_color}]{va_fmae*1000:6.1f}[/{va_color}][dim] meV/Å[/]  "
+            f"[dim]{dt:.0f}s[/]{star}"
+        )
+        logger.info(
+            f"epoch={epoch}  "
+            f"train_loss={tr_loss:.4f}  train_fmae={tr_fmae*1000:.1f}meV/A  "
+            f"val_loss={va_loss:.4f}  val_fmae={va_fmae*1000:.1f}meV/A  "
+            f"lr={current_lr:.2e}  time={dt:.0f}s"
+            + ("  [best]" if improved else "")
         )
 
-    print(f"\nBest val F-MAE: {best_val_fmae*1000:.1f} meV/Å")
-    print(f"Checkpoint saved → {out_ckpt}")
+    # ── Final summary ─────────────────────────────────────────────────────────
+    total_time = time.time() - train_start
+    summary = {
+        "run_name":                run_name,
+        "best_val_fmae_mevA":      round(best_val_fmae * 1000, 3),
+        "best_epoch":              best_epoch,
+        "total_training_time_sec": round(total_time, 1),
+        "total_epochs_completed":  args.epochs - start_epoch + 1,
+        "checkpoint_dir":          str(ckpt_dir),
+        "final_learning_rate":     scheduler.get_last_lr()[0],
+    }
+    _save_summary(ckpt_dir, summary)
+
+    console.print(Rule(style="blue dim"))
+    console.print(f"[bold green]Best val F-MAE: {best_val_fmae*1000:.1f} meV/Å  "
+                  f"[dim](epoch {best_epoch})[/][/]")
+    console.print(f"[dim]best.pt   →[/] {best_ckpt}")
+    console.print(f"[dim]latest.pt →[/] {latest_ckpt}")
+    logger.info(f"=== done  best_val_fmae={best_val_fmae*1000:.1f}meV/A  "
+                f"best_epoch={best_epoch}  total_time={total_time:.0f}s ===")
 
 
 if __name__ == "__main__":
