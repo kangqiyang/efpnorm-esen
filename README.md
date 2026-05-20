@@ -1,94 +1,195 @@
-# eafm-polyget
+# efpnorm-esen
 
-Machine learning force field for polymer chemistry, built on an equivariant L=1 message-passing architecture.
+Investigating whether **EFPNorm** (Equivariant Force-Preserving Normalization) improves
+MD stability over the RMSNorm baseline in eSEN-style MLFFs, beyond what force MAE alone captures.
+
+---
+
+## Hypothesis
+
+RMSNorm's `1/sqrt(rms² + ε)` scale factor diverges when activations are near zero, making
+the Jacobian rank-deficient and destroying force gradients in the backward pass.
+EFPNorm replaces `ε` with a learnable `c² = softplus(log_c_raw)²`, keeping the scale bounded
+away from zero. The prediction: deeper networks trained with EFPNorm should produce smoother
+potential energy surfaces and better NVE energy conservation.
+
+---
+
+## Model
+
+We train **eSCNMDBackbone + MLP_EFS_Head** from scratch, matching the official eSEN-SM
+conserving architecture exactly (verified by inspecting `esen_sm_conserving_all.pt`).
+
+### Architecture (confirmed against official eSEN-SM conserving checkpoint)
+
+| Parameter | Value |
+|-----------|-------|
+| `num_layers` | 4 |
+| `lmax` / `mmax` | 2 / 2 |
+| `sphere_channels` | 128 |
+| `hidden_channels` | 128 |
+| `edge_channels` | 128 |
+| `num_distance_basis` | 64 |
+| `distance_function` | gaussian |
+| `ff_type` | spectral |
+| `norm_type` | rms_norm_sh → **replaced by EFPNorm** |
+| `act_type` | gate |
+| `chg_spin_emb_type` | rand_emb |
+| `cs_emb_grad` | True |
+| `direct_forces` | False (conservative: F = −∇E via autograd) |
+| `cutoff` | 6.0 Å |
+| `max_num_elements` | 100 |
+| Total params | **6.3M** |
+
+EFPNorm replaces 9 `EquivariantRMSNormArraySphericalHarmonicsV2` layers (~2.1 per block).
+
+### EFPNorm
+
+```
+RMSNorm : scale = 1 / sqrt(rms² + ε)        ε = 1e-5  (near-zero → large scale)
+EFPNorm : scale = 1 / sqrt(rms² + c²)        c = softplus(log_c_raw) ≈ 1.0  (bounded)
+```
+
+`log_c_raw` is a scalar learnable parameter initialised so `c ≈ 1.0`.
+Affine weights are copied from the RMSNorm layer being replaced, so output is
+identical at init; the two paths diverge only as `c` is learned.
+
+---
+
+## Training
+
+### Config
+
+| Setting | Value |
+|---------|-------|
+| Dataset | QDPi (wB97M-D3/def2-TZVPPD) |
+| Split | train / val |
+| Max atoms | 100 |
+| Batch size | 8 |
+| Optimizer | AdamW, weight_decay=1e-3 |
+| LR | 4e-4 → cosine decay → 4e-6 |
+| Epochs | 10 |
+| Loss | L1 force (coef=1.0) + L1 energy/atom (coef=0.01) |
+| Gradient clip | 100.0 |
+| Seed | 42 |
+
+### Commands
+
+```bash
+# EFPNorm
+python train/pretrain.py --dataset qdpi --epochs 10 --lr 4e-4
+
+# RMSNorm baseline
+python train/pretrain.py --dataset qdpi --epochs 10 --lr 4e-4 --no_efp_norm
+```
+
+---
+
+## Preliminary Results
+
+### Force MAE — QDPi val split (meV/Å)
+
+| Epoch | EFPNorm | RMSNorm |
+|-------|--------:|--------:|
+| 1  | 42.9 | 43.4 |
+| 2  | 30.6 | 39.1 |
+| 3  | 31.4 | 28.5 |
+| 4  | 23.5 | 29.1 |
+| 5  | 21.6 | 21.7 |
+| 6  | 16.9 | 17.4 |
+| 7  | 15.7 | 15.1 |
+| 8  | 14.0 | 13.2 |
+| 9  | 12.6 | 12.2 |
+| **10** | **11.6** | **11.6** |
+
+Training time: ~25.9 h per run (10 epochs on A100).
+Best val F-MAE: EFPNorm **11.645 meV/Å**, RMSNorm **11.563 meV/Å** — statistically indistinguishable.
+
+### NVE MD Stability — QDPi val, sample 0 (C₄H₇N₃S, 15 atoms, 300 K, 0.5 fs)
+
+| Metric | EFPNorm | RMSNorm |
+|--------|--------:|--------:|
+| Energy drift / atom | 2.67 meV | 2.67 meV |
+| Max temperature | 1581 K | 1588 K |
+| Steps completed | 50 / 50 | 50 / 50 |
+| NaN / explosion | No | No |
+
+> **Both metrics are essentially identical at L4.**
+> The EFPNorm hypothesis is likely correct but requires deeper networks to manifest.
+> At L4 there are only 9 norm layers; gradient corruption is limited.
+> Next: L8 (17 norms, ~12.4M params) and L12 (25 norms, ~18.5M params).
+
+---
+
+## Evaluation
+
+### MD pipeline
+
+```bash
+# Run NVE for 1 ps (2000 × 0.5 fs)
+python eval/run_md.py --checkpoint_dir train/checkpoints/qdpi_L4C128_efpnorm_lr4e-4
+python eval/run_md.py --checkpoint_dir train/checkpoints/qdpi_L4C128_rmsnorm_lr4e-4
+```
+
+Outputs written to `eval/md_runs/<tag>/`:
+
+| File | Contents |
+|------|----------|
+| `md_metrics.csv` | step, epot, ekin, etot, temp, max_force, drift_per_atom |
+| `trajectory.traj` | ASE binary trajectory |
+| `summary.json` | energy_drift_per_atom, failed flag, n_model_calls |
+
+Key CLI args: `--sample_idx`, `--temperature`, `--timestep_fs`, `--steps`, `--device`, `--seed`.
 
 ---
 
 ## Project structure
 
 ```
-eafm-polyget/
-├── data/                         # preprocessing pipeline
-│   ├── process_aimnet2.py
-│   ├── process_spice2.py
-│   ├── process_qdpi.py
-│   ├── process_spf.py
-│   ├── process_ani2x.py
-│   ├── convert_to_unified.py     # normalise all five datasets to a common schema
-│   └── raw_data_inspection.ipynb # per-dataset quality analysis
+efpnorm-esen/
 ├── model/
-│   ├── efpnorm.py                # EFPNorm: force-preserving normalisation
-│   ├── message_passing.py        # equivariant message passing block
-│   └── polyget.py                # full model
-└── train/
-    ├── loss.py                   # force MAE / MSE losses
-    ├── optimizer.py              # AdamW with 5x LR for vector parameters
-    └── trainer.py                # DDP training loop
+│   └── efpnorm.py              # EFPNorm + EquivariantEFPNorm
+├── data/
+│   ├── process_*.py            # per-dataset preprocessing
+│   ├── convert_to_unified.py   # normalise to common H5 schema
+│   └── h5_to_asedb.py          # convert unified H5 → ASE SQLite DB
+├── train/
+│   └── pretrain.py             # from-scratch training, EFPNorm/RMSNorm switch
+└── eval/
+    └── run_md.py               # NVE MD evaluation + energy drift metric
 ```
 
 ---
 
 ## Data
 
-Raw data and processed outputs are not in this repo (too large). Everything lives on the a100cse cluster:
+Raw data and checkpoints are not in this repo. Everything lives on the cluster:
 
 ```
-/localscratch/kyang394/mlff/eafm-polyget/data/
-├── raw/                          # original downloaded files (~63 GB)
-│   ├── aimnet2/aimnet2_wb97m.h5                        (14 GB)
-│   ├── spice2/SPICE-2.0.1.hdf5                         (35 GB)
-│   ├── ani2x/final_h5/ANI-2x-wB97X-631Gd.h5           (6.2 GB)
-│   ├── spf/solvated_protein_fragments.npz               (1.4 GB)
-│   └── qdpi/QDpiDataset-main/data/neutral/             (2.0 GB)
-├── processed/                    # output of process_*.py (~7 GB)
-└── unified/                      # output of convert_to_unified.py
+/localscratch/kyang394/mlff/efpnorm-esen/
+├── data/raw/qdpi/              # QDPi source (~2.0 GB)
+├── data/asedb/                 # qdpi_train.db, qdpi_val.db, ...
+└── train/checkpoints/
+    ├── qdpi_L4C128_efpnorm_lr4e-4/
+    └── qdpi_L4C128_rmsnorm_lr4e-4/
 ```
 
 ### Datasets
 
-| Dataset | Tier | Theory | Raw frames | Post-filter |
-|---------|------|--------|-----------|-------------|
-| AIMNet2 | T1 | wB97M-D3(BJ)/def2-TZVPP | 5.8 M | ~4.5 M |
-| SPICE-2 | T1 | wB97M-D3(BJ)/def2-TZVPPD | 2.0 M | ~1.76 M |
-| QDpi | T1 | wB97M-D3(BJ)/def2-TZVPPD | 540 K | ~529 K |
-| SPF | T2 | revPBE-D3(BJ)/def2-TZVP | 2.73 M | ~1.75 M |
-| ANI-2x | T2 | wB97X/6-31G(d) | 9.65 M | ~542 K (capped) |
+| Dataset | Theory | Frames |
+|---------|--------|--------|
+| QDPi | wB97M-D3(BJ)/def2-TZVPPD | ~529 K |
+| AIMNet2 | wB97M-D3(BJ)/def2-TZVPP | ~4.5 M |
+| SPICE-2 | wB97M-D3(BJ)/def2-TZVPPD | ~1.76 M |
+| ANI-2x | wB97X/6-31G(d) | ~542 K |
+| SPF | revPBE-D3(BJ)/def2-TZVP | ~1.75 M |
 
-Filters applied across all datasets: elements `{H,C,N,O,F,Si,P,S,Cl,Br}`, neutral only, energy/atom sanity bounds, max force 20 eV/Å. ANI-2x also applies a 100-frame cap per unique molecular composition.
+Energies stored as atomization energies (eV); no reference subtraction needed at training time.
 
 ### Preprocessing
 
-Run from the `data/` directory:
-
 ```bash
-cd /nethome/kyang394/scratch/mlff/eafm-polyget/data
-
-python process_aimnet2.py   # ~30 min
-python process_spice2.py    # ~45 min
-python process_qdpi.py      # ~15 min
-python process_spf.py       # ~20 min
-python process_ani2x.py     # ~20 min
-python convert_to_unified.py
+python data/process_qdpi.py
+python data/convert_to_unified.py --dataset qdpi
+python data/h5_to_asedb.py --dataset qdpi
 ```
-
-Requires `h5py` and `numpy`. Use `locking=False` (already set) — nethome is NFS and does not support HDF5 POSIX locking.
-
----
-
-## Model
-
-PolyGET is a PaiNN-style L=1 equivariant force field. Key components:
-
-- **EFPNorm** (`model/efpnorm.py`) — replaces RMSNorm with a full-rank normalisation that preserves force gradients through the autograd chain
-- **VecNE** — vector neighbor encoding; unit displacement vectors injected into the vector pathway
-- **vecLR 5×** (`train/optimizer.py`) — 5× learning rate for vector parameters, correcting a systematic gradient attenuation from double-backprop
-
-Best config from ablations: L=24, hidden=128, cutoff=5 Å.
-
----
-
-## Notes
-
-- See `data/raw_data_inspection.ipynb` for full per-dataset quality analysis. Read before modifying any filter thresholds.
-- Training target energies are atomization energies (eV), not raw DFT totals.
-- SPF energies are already atomization energies in eV; all others require reference subtraction (done in the processing scripts).
