@@ -34,17 +34,45 @@ DATASETS = ["aimnet2", "spice2", "qdpi", "ani2x", "spf"]
 
 
 def iter_frames(h5_path: Path):
-    """Yield (atomic_numbers, positions, energy, forces) for every frame."""
+    """Yield (atomic_numbers, positions, energy, forces) for every frame.
+
+    Handles two unified-H5 group layouts:
+      types (n_atoms,)            — one fixed formula per group (spice2/spf/qdpi)
+      types (n_frames, n_atoms)   — atom-count bucket groups (aimnet2/ani2x);
+                                    split on-the-fly by unique molecular formula.
+    """
+    _required = {"types", "pos", "energy", "forces"}
     with h5py.File(h5_path, "r", locking=False) as f:
-        for mol_key in f.keys():
-            grp = f[mol_key]
-            Z   = grp["types"][()]                  # (n_atoms,)
-            pos = grp["pos"][()]                    # (n_frames, n_atoms, 3)
-            E   = grp["energy"][()]                 # (n_frames,)
-            F   = grp["forces"][()]                 # (n_frames, n_atoms, 3)
-            n_frames = len(E)
-            for i in range(n_frames):
-                yield Z, pos[i], float(E[i]), F[i]
+        groups = []
+        f.visititems(lambda name, obj: groups.append(name)
+                     if isinstance(obj, h5py.Group) and _required.issubset(obj.keys())
+                     else None)
+        for grp_name in groups:
+            grp = f[grp_name]
+            Z   = grp["types"][()]   # (n_atoms,) or (n_frames, n_atoms)
+            pos = grp["pos"][()]     # (n_frames, n_atoms, 3)
+            E   = grp["energy"][()]  # (n_frames,)
+            F   = grp["forces"][()]  # (n_frames, n_atoms, 3)
+
+            if Z.ndim == 1:
+                # One formula for all frames in this group.
+                for i in range(len(E)):
+                    yield Z, pos[i], float(E[i]), F[i]
+            elif Z.ndim == 2:
+                # Atom-count bucket: split by unique molecular formula.
+                unique_types, inverse = np.unique(
+                    Z.astype(np.int32), axis=0, return_inverse=True
+                )
+                for mol_idx, formula in enumerate(unique_types):
+                    mask = inverse == mol_idx
+                    idxs = np.where(mask)[0]
+                    for i in idxs:
+                        yield formula, pos[i], float(E[i]), F[i]
+            else:
+                raise ValueError(
+                    f"Group '{grp_name}' in {h5_path.name}: "
+                    f"unexpected types shape {Z.shape}"
+                )
 
 
 def write_db(frames, db_path: Path, dataset_name: str):
