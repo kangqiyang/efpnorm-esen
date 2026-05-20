@@ -37,7 +37,7 @@ DATASETS = {
         "pos_key":    "coord",
         "energy_key": "energy_atomization",
         "forces_key": "forces",
-        "types_2d":   True,   # numbers is (n_frames, n_atoms); take row 0
+        "types_2d":   True,   # numbers is (n_frames, n_atoms); grouped by atom count
     },
     "ani2x": {
         "src": SRC / "ani2x_processed.h5",
@@ -45,7 +45,7 @@ DATASETS = {
         "pos_key":    "coordinates",
         "energy_key": "energy_atomization",
         "forces_key": "forces",
-        "types_2d":   True,   # species is (n_frames, n_atoms); take row 0
+        "types_2d":   True,   # species is (n_frames, n_atoms); grouped by atom count
     },
     "spice2": {
         "src": SRC / "spice2_processed.h5",
@@ -104,24 +104,28 @@ def convert_dataset(name, cfg):
                 return  # skip groups that don't have all fields (e.g. nested dirs)
 
             raw_types = g[cfg["types_key"]][()]
-            if cfg["types_2d"]:
-                # species is (n_frames, n_atoms) — all rows identical, take first
-                types = raw_types[0].astype(np.int32)
-            else:
-                types = raw_types.astype(np.int32)
-
             pos    = g[cfg["pos_key"]][()].astype(np.float32)
             energy = g[cfg["energy_key"]][()].astype(np.float64)
             forces = g[cfg["forces_key"]][()].astype(np.float32)
 
             # Use a flat group name (replace '/' with '__' for nested QDpi groups)
             flat_name = name_in_file.replace("/", "__")
-            dg = dst.require_group(flat_name)
-            dg.create_dataset("types",  data=types,  compression="gzip", compression_opts=4)
-            dg.create_dataset("pos",    data=pos,    compression="gzip", compression_opts=4)
-            dg.create_dataset("energy", data=energy, compression="gzip", compression_opts=4)
-            dg.create_dataset("forces", data=forces, compression="gzip", compression_opts=4)
+            kw = dict(compression="gzip", compression_opts=4)
 
+            dg = dst.require_group(flat_name)
+            if cfg["types_2d"]:
+                # raw_types is (n_frames, n_atoms) — groups are by atom count, NOT by
+                # molecule, so rows differ across frames.  Store the full 2D array so
+                # h5_to_asedb.py can split by unique formula without creating millions
+                # of tiny H5 groups here.
+                types = raw_types.astype(np.int32)   # (n_frames, n_atoms)
+            else:
+                types = raw_types.astype(np.int32)   # (n_atoms,)
+
+            dg.create_dataset("types",  data=types,  **kw)
+            dg.create_dataset("pos",    data=pos,    **kw)
+            dg.create_dataset("energy", data=energy, **kw)
+            dg.create_dataset("forces", data=forces, **kw)
             n_groups += 1
             n_frames += len(energy)
 
