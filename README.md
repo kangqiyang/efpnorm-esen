@@ -105,19 +105,33 @@ python train/pretrain.py --dataset qdpi --epochs 10 --lr 4e-4 --no_efp_norm
 Training time: ~25.9 h per run (10 epochs on A100).
 Best val F-MAE: EFPNorm **11.645 meV/Å**, RMSNorm **11.563 meV/Å** — statistically indistinguishable.
 
-### NVE MD Stability — QDPi val, sample 0 (C₄H₇N₃S, 15 atoms, 300 K, 0.5 fs)
+### NVE MD Stability — QDPi val (2.5 ps, 300 K, 0.5 fs, seed 42)
 
-| Metric | EFPNorm | RMSNorm |
-|--------|--------:|--------:|
-| Energy drift / atom | 2.67 meV | 2.67 meV |
-| Max temperature | 1581 K | 1588 K |
-| Steps completed | 50 / 50 | 50 / 50 |
-| NaN / explosion | No | No |
+We ran a systematic comparison across 80 val-set molecules split into two conditions
+based on their DFT reference max force norm (`eval/rank_md_candidates.py`):
 
-> **Both metrics are essentially identical at L4.**
-> The EFPNorm hypothesis is likely correct but requires deeper networks to manifest.
-> At L4 there are only 9 norm layers; gradient corruption is limited.
-> Next: L8 (17 norms, ~12.4M params) and L12 (25 norms, ~18.5M params).
+| Condition | max_F range | n molecules | EFP wins | RMS wins |
+|-----------|-------------|:-----------:|:--------:|:--------:|
+| Equilibrated | < 0.15 eV/Å | 30 | 10 (33%) | **20 (67%)** |
+| Strained | ~19–20 eV/Å | 46 valid / 50 | 32 (64%) | 18 (36%) |
+
+**Paired t-test results (energy drift per atom, meV/atom):**
+
+| Condition | EFP mean | RMS mean | Mean diff (EFP−RMS) | t | p | Cohen's d |
+|-----------|:--------:|:--------:|:-------------------:|:-:|:-:|:---------:|
+| Equilibrated | 0.168 | 0.164 | +0.004 | 2.76 | **0.010** | 0.50 |
+| Strained | 5.744 | 5.778 | −0.034 | −0.55 | 0.585 (n.s.) | −0.08 |
+
+**Interpretation:**
+
+- On near-equilibrium structures, RMSNorm is statistically significantly better (p = 0.01),
+  but the absolute effect is negligible (~0.004 meV/atom, ~2.7% relative difference).
+- On strained structures, EFPNorm wins more often by head-count (64%) but the mean drift
+  difference is only 0.034 meV/atom (~0.6%), which is not statistically significant (p = 0.59).
+- **Overall: EFPNorm shows no meaningful MD stability advantage over RMSNorm at L4 depth**
+  on QDPi checkpoints. The gradient-preservation argument may require deeper networks
+  (more norm layers) to manifest in MD observables.
+- 4 of 50 strained runs failed (temperature blow-up); excluded from t-test.
 
 ---
 
@@ -126,9 +140,18 @@ Best val F-MAE: EFPNorm **11.645 meV/Å**, RMSNorm **11.563 meV/Å** — statist
 ### MD pipeline
 
 ```bash
-# Run NVE for 1 ps (2000 × 0.5 fs)
+# Single run
 python eval/run_md.py --checkpoint_dir train/checkpoints/qdpi_L4C128_efpnorm_lr4e-4
-python eval/run_md.py --checkpoint_dir train/checkpoints/qdpi_L4C128_rmsnorm_lr4e-4
+
+# Paired comparison across many molecules (efpnorm vs rmsnorm in parallel)
+python eval/run_md_compare.py \
+    --device0 cuda:0 --device1 cuda:1 \
+    --steps 5000 --out_json eval/md_runs/comparison_equil.json \
+    --skip_existing \
+    --sample_indices 2966 15927 9223 ...
+
+# Rank val-set structures by DFT force norm (equilibrated / strained)
+python eval/rank_md_candidates.py --dataset qdpi --split val --top_k 50
 ```
 
 Outputs written to `eval/md_runs/<tag>/`:
@@ -139,7 +162,9 @@ Outputs written to `eval/md_runs/<tag>/`:
 | `trajectory.traj` | ASE binary trajectory |
 | `summary.json` | energy_drift_per_atom, failed flag, n_model_calls |
 
-Key CLI args: `--sample_idx`, `--temperature`, `--timestep_fs`, `--steps`, `--device`, `--seed`.
+`run_md_compare.py` key args: `--out_json` (output path), `--skip_existing` (resume interrupted runs).
+
+Key CLI args for `run_md.py`: `--sample_idx`, `--temperature`, `--timestep_fs`, `--steps`, `--device`, `--seed`.
 
 ---
 
@@ -156,7 +181,9 @@ efpnorm-esen/
 ├── train/
 │   └── pretrain.py             # from-scratch training, EFPNorm/RMSNorm switch
 └── eval/
-    └── run_md.py               # NVE MD evaluation + energy drift metric
+    ├── run_md.py               # NVE MD evaluation + energy drift metric
+    ├── run_md_compare.py       # paired efpnorm vs rmsnorm comparison across molecules
+    └── rank_md_candidates.py   # rank val-set structures by DFT force norm
 ```
 
 ---
