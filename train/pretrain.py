@@ -620,13 +620,18 @@ def main():
         model.load_state_dict(state["model"])
         if "optimizer" in state:
             optimizer.load_state_dict(state["optimizer"])
-        if "scheduler" in state:
-            scheduler.load_state_dict(state["scheduler"])
         start_epoch   = state["epoch"] + 1
         best_val_fmae = state.get("best_val_fmae", float("inf"))
         best_epoch    = state.get("best_epoch", 0)
+        # Advance the scheduler (T_max=args.epochs) to the correct position
+        # in the new cosine schedule rather than restoring the old state.
+        # Scheduler was constructed with base_lrs=[args.lr] before optimizer
+        # state was loaded, so base_lrs are unaffected by the state restore.
+        for _ in range(start_epoch - 1):
+            scheduler.step()
         console.print(f"  [yellow]↑ resumed[/] epoch {state['epoch']}  "
                       f"best F-MAE {best_val_fmae*1000:.1f} meV/Å  "
+                      f"lr={scheduler.get_last_lr()[0]:.2e}  "
                       f"[dim]{resume_path}[/]")
         logger.info(f"resumed from epoch {state['epoch']}  "
                     f"best_val_fmae={best_val_fmae:.6f}  path={resume_path}")

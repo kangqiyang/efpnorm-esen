@@ -273,7 +273,8 @@ def run_md(args):
         out_dir = Path(args.out_dir)
     else:
         tag = (f"{run_name}_{args.split}_s{args.sample_idx}"
-               f"_T{int(args.temperature)}_dt{args.timestep_fs}_N{args.steps}")
+               f"_T{int(args.temperature)}_dt{args.timestep_fs}_N{args.steps}"
+               f"_seed{args.seed}")
         out_dir = _ROOT / "eval" / "md_runs" / tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
