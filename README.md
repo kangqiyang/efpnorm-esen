@@ -133,6 +133,57 @@ based on their DFT reference max force norm (`eval/rank_md_candidates.py`):
   (more norm layers) to manifest in MD observables.
 - 4 of 50 strained runs failed (temperature blow-up); excluded from t-test.
 
+### NVE MD Stability — AIMNet2 val (2.5 ps, 300 K, 0.5 fs, seed 42)
+
+Paired comparison across 50 randomly-selected val-set molecules, both models run from
+identical initial conditions. Results saved in `eval/md_runs/comparison_aimnet2_full50.json`.
+
+**Win count:** EFPNorm wins 31/50 molecules (62%) by lower drift per atom.
+
+**Drift statistics (meV/atom):**
+
+| | EFPNorm | RMSNorm |
+|---|---:|---:|
+| Mean (all 50) | 0.910 | 1.937 |
+| Mean (stable 47) | 0.242 | 0.315 |
+| Median (all 50) | 0.163 | 0.172 |
+| Std | 3.69 | 6.48 |
+| p90 | 0.578 | 1.207 |
+
+**Statistical tests (paired, non-parametric):**
+
+| Test | All 50 | Stable 47 |
+|------|:------:|:---------:|
+| Binomial (H₀: p=0.5) | p = 0.060 (n.s.) | p = 0.072 (n.s.) |
+| Wilcoxon signed-rank | p = 0.063 (n.s.) | p = 0.076 (n.s.) |
+
+The 31/50 win count and the 2× mean gap are both **not statistically significant at p < 0.05**.
+93% of the mean gap is attributable to just 3 outlier molecules; the median difference on
+stable molecules is only +0.003 meV/atom (95% bootstrap CI: [−0.003, +0.012]).
+
+**Tail stability (threshold: 5 meV/atom):**
+
+| Category | Count |
+|----------|:-----:|
+| Both stable | 47/50 |
+| Only RMSNorm explodes | 1/50 |
+| Both explode | 2/50 |
+| Only EFPNorm explodes | 0/50 |
+
+EFPNorm has zero solo blow-ups vs. one for RMSNorm (mol 253132, C15H22O: 2.2 vs 31.2 meV/atom).
+This tail observation is consistent with the hypothesis but n=50 is too small to test it
+rigorously — the solo-explosion count is 1 vs 0, which gives p = 0.5 by a one-sided sign test.
+
+**Interpretation:**
+
+- On typical molecules the two models are essentially indistinguishable (median ratio 1.03,
+  CI crosses 1.0).
+- The mean gap is dominated by a small number of molecules where RMSNorm diverges much more
+  severely; EFPNorm appears more robust in the tail, but this is not yet statistically confirmed
+  at n=50.
+- **To test the tail-stability hypothesis properly, ~150–200 molecules are needed** to have
+  80% power to detect the observed explosion-rate difference.
+
 ---
 
 ## Evaluation
