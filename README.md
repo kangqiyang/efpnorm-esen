@@ -54,6 +54,41 @@ EFPNorm : scale = 1 / sqrt(rms² + c²)        c = softplus(log_c_raw) ≈ 1.0  
 Affine weights are copied from the RMSNorm layer being replaced, so output is
 identical at init; the two paths diverge only as `c` is learned.
 
+### Learned c Values (AIMNet2 best checkpoint)
+
+![EFPNorm learned c values](eval/efpnorm_c_values.png)
+
+Each of the 9 EFPNorm layers learns an independent `c`. Extracted from
+`train/checkpoints/aimnet2_L4C128_efpnorm_lr4e-4/best.pt`:
+
+| Layer | c |
+|-------|--:|
+| Block 0 — norm₁ (pre-attn) | 0.966 |
+| Block 0 — norm₂ (pre-FFN)  | 0.204 |
+| Block 1 — norm₁ (pre-attn) | **2.264** |
+| Block 1 — norm₂ (pre-FFN)  | 0.063 |
+| Block 2 — norm₁ (pre-attn) | 1.567 |
+| Block 2 — norm₂ (pre-FFN)  | 0.042 |
+| Block 3 — norm₁ (pre-attn) | 0.671 |
+| Block 3 — norm₂ (pre-FFN)  | 0.175 |
+| Final norm                   | 0.752 |
+
+**Key observations:**
+
+- **norm₁ (pre-attention) learned large c** — blocks 1–2 pushed well above the
+  init of 1.0, indicating the model actively uses EFP protection before attention.
+  Equivariant SH features entering attention can be sparse/near-zero, and large c
+  prevents the normalization scale from diverging there.
+- **norm₂ (pre-FFN) learned c ≈ 0.04–0.20** — all four blocks collapsed toward
+  near-standard RMSNorm. EFP protection is essentially unused before the FFN,
+  suggesting FFN inputs are already well-distributed.
+- **Protection concentrates in middle blocks** — Block 1 norm₁ has the highest c
+  (2.26); the first and last blocks are closer to init or below. The gradient
+  instability the hypothesis targets manifests most strongly in middle-depth
+  pre-attention norms.
+- **Implication** — a *selective* EFPNorm (only norm₁ in blocks 1–2, RMSNorm
+  elsewhere) may capture most of the tail-stability benefit with fewer parameters.
+
 ---
 
 ## Training
