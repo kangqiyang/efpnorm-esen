@@ -184,6 +184,62 @@ rigorously — the solo-explosion count is 1 vs 0, which gives p = 0.5 by a one-
 - **To test the tail-stability hypothesis properly, ~150–200 molecules are needed** to have
   80% power to detect the observed explosion-rate difference.
 
+### NVE MD Stability — AIMNet2 val (200-molecule extended run)
+
+Follow-up to the 50-molecule pilot above, directly testing the tail-stability hypothesis.
+Results saved in `eval/md_runs/comparison_aimnet2_full200.json`.
+
+**Win count:** EFPNorm wins 110/200 molecules (55%) by lower drift per atom.
+
+**Drift statistics (meV/atom):**
+
+| | EFPNorm | RMSNorm |
+|---|---:|---:|
+| Mean | 3.06 | 4.36 |
+| Median | 0.215 | 0.212 |
+| Std | 9.18 | 21.47 |
+| p90 | 2.23 | 4.09 |
+| p95 | 27.9 | 27.4 |
+| Max | 53.2 | 280.1 |
+| Failed | 1 | 1 |
+
+**Statistical test:**
+
+| Test | Result |
+|------|--------|
+| Sign test (efp wins=110, rms wins=89) | z = 1.49, p ≈ 0.14 (n.s.) |
+
+**Breakdown by molecule size:**
+
+| Atom count | n | EFP wins | EFP mean (meV/atom) | RMS mean (meV/atom) |
+|------------|:-:|:--------:|--------------------:|--------------------:|
+| 1–10 | 13 | 9 (69%) | 0.37 | 0.43 |
+| 11–20 | 69 | 28 (41%) | 0.39 | 0.37 |
+| 21–30 | 61 | 37 (61%) | 0.30 | 0.29 |
+| 31–50 | 51 | 34 (67%) | 8.93 | 14.66 |
+| 51+ | 6 | 2 (33%) | 17.7 | 12.6 |
+
+**Tail stability (threshold: 5 meV/atom):**
+
+| Category | Count |
+|----------|:-----:|
+| High-drift molecules (either > 5 meV/atom) | 21/200 |
+| Biggest RMS failure | mol 39411 (C17H25N3): efp=40 vs rms=**280** meV/atom |
+| Biggest EFP failure | mol 357430 (C13H25NO5S): efp=32 vs rms=1 meV/atom |
+
+**Interpretation:**
+
+- The overall 55% win rate is **not statistically significant** (p ≈ 0.14). Median difference
+  is negligible (0.215 vs 0.212 meV/atom) — on typical molecules the two models are equivalent.
+- The mean gap (3.1 vs 4.4 meV/atom) is almost entirely driven by tail outliers, particularly
+  one catastrophic rmsnorm blow-up (C17H25N3: 280 meV/atom vs 40 for efpnorm).
+- **EFPNorm's advantage concentrates in large molecules (31–50 atoms):** 34/51 wins,
+  mean drift 8.9 vs 14.7 meV/atom. This is consistent with the gradient-preservation hypothesis
+  mattering more when there are more norm layers being traversed in deeper/wider molecular graphs.
+- Small molecules (<30 atoms, n=143): no meaningful difference.
+- EFPNorm also has tail failures (5 molecules where efp is >10 meV worse than rms), so neither
+  model is unconditionally more stable — efpnorm simply fails less catastrophically on average.
+
 ---
 
 ## Evaluation
