@@ -17,3 +17,7 @@ scratch/
 __pycache__/
 eval/md_runs/
 train/checkpoints/
+
+# Raw training/MD run logs (regenerable via train/pretrain.py, eval/run_md_compare*.py)
+*.log
+eval/logs/
