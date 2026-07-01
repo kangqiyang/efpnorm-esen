@@ -83,11 +83,58 @@ Each of the 9 EFPNorm layers learns an independent `c`. Extracted from
   near-standard RMSNorm. EFP protection is essentially unused before the FFN,
   suggesting FFN inputs are already well-distributed.
 - **Protection concentrates in middle blocks** — Block 1 norm₁ has the highest c
-  (2.26); the first and last blocks are closer to init or below. The gradient
-  instability the hypothesis targets manifests most strongly in middle-depth
-  pre-attention norms.
-- **Implication** — a *selective* EFPNorm (only norm₁ in blocks 1–2, RMSNorm
-  elsewhere) may capture most of the tail-stability benefit with fewer parameters.
+  (2.26); the first and last blocks are closer to init or below.
+- **Implication (revised — see mechanism probe below)** — a large learned `c` at
+  blocks 1–2 does *not* mean the near-zero-activation protection is actually being
+  used there in practice; direct measurement shows the opposite (protection is only
+  ever real at block 0).
+
+### Mechanism probe: does either regularizer ever actually engage on real chemistry?
+
+Everything above (F-MAE, MD energy drift) is a downstream proxy. `eval/probe_norm_gradients.py`
+tests the mechanism directly: it hooks every one of the 9 norm layers during a real
+forward+conservative-force-backward pass (the same autograd path as training) on all 200
+AIMNet2 val molecules from the earlier screen, and records, per atom, the pre-regularizer
+activation energy `s² = raw_ms` (computed by replicating each layer's internal formula up to
+but not including the `+eps`/`+c²` step) and the gradient ratio `‖grad_in‖ / ‖grad_out‖` through
+that layer.
+
+**Is `s²` ever actually close to the regularizer, on trained models processing real molecules?**
+
+| Layer | min(s²) / eps (RMSNorm) | min(s²) / c² (EFPNorm) |
+|-------|------------------------:|------------------------:|
+| block 0 – norm₁ (first layer) | 13,400× | **0.10×** ← only layer where it's engaged |
+| block 0 – norm₂ | 2.45M× | 201× |
+| block 1 – norm₁ | 36M× | 18× |
+| block 1 – norm₂ | 42M× | 32,100× |
+| block 2 – norm₁ | 54M× | 87× |
+| block 2 – norm₂ | 70M× | 161,000× |
+| block 3 – norm₁ | 116M× | 1,200× |
+| block 3 – norm₂ | 175M× | 22,700× |
+| final norm | 313M× | 2,210× |
+
+- **RMSNorm's `eps=1e-5` is 4–8 orders of magnitude smaller than the real activation energy at
+  every layer, across all 200 molecules.** The literal "scale factor diverges near zero" failure
+  mode this whole project is testing for does not occur in a converged, trained model — `eps` is
+  never doing anything.
+- **EFPNorm's learned `c²` is only ever comparable to real activations at one layer** —
+  `block0.norm_1` — where the smallest ~10% of atoms have `s²` within an order of magnitude of
+  `c²`. At the other 8 of 9 layers (including the "large c" blocks 1–2 flagged above), `c²` is
+  also negligible (18×–160,000× smaller than observed activations), so the c-value magnitude
+  alone is misleading about where protection is actually used.
+- **Gradient attenuation points the wrong way for the hypothesis.** At matched layers,
+  RMSNorm's `‖grad_in‖/‖grad_out‖` is equal to or *higher* (less attenuated) than EFPNorm's at
+  almost every layer (e.g. block0.norm_1: RMS 0.86 vs EFP 0.28; block1.norm_2: RMS 0.53 vs EFP
+  0.37) — the opposite of "RMSNorm destroys gradients." Neither model shows gradient blow-up
+  concentrated in the lowest-`s²` decile vs. the highest.
+- **Caveat**: this only rules out the mechanism operating in the *final, converged* model.
+  RMSNorm's instability could still have shaped early training dynamics (the network may have
+  simply learned to avoid producing near-zero activations as a side effect of optimizing under
+  an unstable norm) — a hypothesis this snapshot can't test without probing early-training
+  checkpoints, which weren't saved.
+- **Bottom line**: combined with the null MD-stability results above, this is direct mechanistic
+  evidence — not just a downstream statistical null — that EFPNorm's protection essentially never
+  activates on real molecular chemistry with this trained model, at 8 of its 9 replacement sites.
 
 ---
 
@@ -392,6 +439,7 @@ efpnorm-esen/
     ├── rank_md_candidates.py   # rank val-set structures by DFT force norm
     ├── plot_drift_curves.py    # drift-vs-time overlay plot (per-molecule + mean), L4 vs L6
     ├── plot_drift_diff.py      # paired per-molecule drift-difference-vs-time plot, L4 vs L6
+    ├── probe_norm_gradients.py # direct mechanism probe: per-layer activation energy + gradient ratio
     ├── candidate_ranks/        # precomputed val-set candidate rankings (qdpi, aimnet2)
     ├── figures/                # saved plots referenced in this README
     └── logs/                   # raw stdout logs from MD comparison runs
