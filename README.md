@@ -56,7 +56,7 @@ identical at init; the two paths diverge only as `c` is learned.
 
 ### Learned c Values (AIMNet2 best checkpoint)
 
-![EFPNorm learned c values](eval/efpnorm_c_values.png)
+![EFPNorm learned c values](eval/figures/efpnorm_c_values.png)
 
 Each of the 9 EFPNorm layers learns an independent `c`. Extracted from
 `train/checkpoints/aimnet2_L4C128_efpnorm_lr4e-4/best.pt`:
@@ -140,6 +140,24 @@ python train/pretrain.py --dataset qdpi --epochs 10 --lr 4e-4 --no_efp_norm
 Training time: ~25.9 h per run (10 epochs on A100).
 Best val F-MAE: EFPNorm **11.645 meV/Å**, RMSNorm **11.563 meV/Å** — statistically indistinguishable.
 
+### Depth comparison — L4 vs L6 (QDPi, 30 epochs)
+
+Same training config, `num_layers` 4 vs 6 (`train/checkpoints/qdpi_L{4,6}C128_{efpnorm,rmsnorm}_lr4e-4`).
+
+| Depth | Norm | Best val F-MAE (meV/Å) | Total train time |
+|-------|------|------------------------:|------------------:|
+| L4 | EFPNorm | 11.03 | 79.7 h |
+| L4 | RMSNorm | 11.00 | 78.7 h |
+| L6 | EFPNorm | **7.68** | 101.1 h |
+| L6 | RMSNorm | 7.80 | 101.8 h |
+
+- Depth is the dominant lever here: L4→L6 cuts val F-MAE by ~30% (11.0 → ~7.7 meV/Å) for ~1.3× the
+  training cost — an unsurprising result for a message-passing GNN (more layers = larger effective
+  receptive field), not evidence about normalization specifically.
+- At L4, RMSNorm edges out EFPNorm (11.00 vs 11.03); at L6, EFPNorm edges out RMSNorm (7.68 vs 7.80).
+  Both gaps are small enough, and each config is a single training seed, that this reversal is more
+  likely run-to-run noise than a real depth-dependent effect on the norm comparison.
+
 ### NVE MD Stability — QDPi val (2.5 ps, 300 K, 0.5 fs, seed 42)
 
 We ran a systematic comparison across 80 val-set molecules split into two conditions
@@ -152,21 +170,47 @@ based on their DFT reference max force norm (`eval/rank_md_candidates.py`):
 
 **Paired t-test results (energy drift per atom, meV/atom):**
 
-| Condition | EFP mean | RMS mean | Mean diff (EFP−RMS) | t | p | Cohen's d |
-|-----------|:--------:|:--------:|:-------------------:|:-:|:-:|:---------:|
-| Equilibrated | 0.168 | 0.164 | +0.004 | 2.76 | **0.010** | 0.50 |
-| Strained | 5.744 | 5.778 | −0.034 | −0.55 | 0.585 (n.s.) | −0.08 |
+| Condition | EFP mean | RMS mean | Mean diff (EFP−RMS) | t | p | Cohen's d | EFP win% |
+|-----------|:--------:|:--------:|:-------------------:|:-:|:-:|:---------:|:--------:|
+| Equilibrated (L4) | 0.168 | 0.164 | +0.004 | 2.76 | **0.010** | 0.50 | 33% (10/30) |
+| Strained (L4) | 5.744 | 5.778 | −0.034 | −0.55 | 0.585 (n.s.) | −0.08 | 67% (31/46) |
+| Strained (L6, same 50 molecules) | 5.674 | 5.658 | +0.016 | 0.28 | 0.779 (n.s.) | 0.04 | 59% (27/46) |
 
 **Interpretation:**
 
 - On near-equilibrium structures, RMSNorm is statistically significantly better (p = 0.01),
   but the absolute effect is negligible (~0.004 meV/atom, ~2.7% relative difference).
-- On strained structures, EFPNorm wins more often by head-count (64%) but the mean drift
-  difference is only 0.034 meV/atom (~0.6%), which is not statistically significant (p = 0.59).
-- **Overall: EFPNorm shows no meaningful MD stability advantage over RMSNorm at L4 depth**
-  on QDPi checkpoints. The gradient-preservation argument may require deeper networks
-  (more norm layers) to manifest in MD observables.
-- 4 of 50 strained runs failed (temperature blow-up); excluded from t-test.
+- On strained structures at L4, EFPNorm wins more often by head-count (67% of valid pairs) but the
+  mean drift difference is only 0.034 meV/atom (~0.6%), not statistically significant (p = 0.59).
+- **Going to L6 does not resolve or strengthen the effect — it flips sign.** EFPNorm still wins
+  more often by head-count (59%), but its *mean* drift is now marginally higher than RMSNorm's
+  (5.674 vs 5.658), the opposite ordering from L4. Both depths are non-significant (p > 0.5). This
+  pattern (small, sign-flipping, non-significant effects across depth) looks more like a genuinely
+  null comparison than a depth-dependent real effect that a deeper network should sharpen.
+- **Overall: EFPNorm shows no meaningful MD stability advantage over RMSNorm on QDPi**, at either
+  L4 or L6 depth.
+- 4/50 (L4) and 3/50 (L6) strained runs failed on the EFPNorm side (temperature blow-up); 3/50 (L4)
+  and 4/50 (L6) failed on the RMSNorm side — failure counts are also roughly symmetric across depth.
+  Failed runs excluded from the paired test (n=46 valid pairs both depths).
+
+**Time-resolved drift (does the gap grow with trajectory duration, or is it just noise?)**
+
+![Drift vs time, L4 vs L6](eval/figures/drift_vs_time_L4_vs_L6.png)
+
+Per-molecule drift trajectories (thin) and across-molecule mean (bold) for all 50 strained
+molecules, both depths. Drift rises during the first ~0.1–0.2 ps (thermalization transient) then
+plateaus — the mean curves for EFPNorm and RMSNorm sit essentially on top of each other for the
+rest of the 2.5 ps window, at both depths. No slow, building divergence is visible in the typical
+case.
+
+![Paired per-molecule drift difference, L4 vs L6](eval/figures/drift_diff_L4_vs_L6.png)
+
+Per-molecule paired difference `drift_rmsnorm(t) − drift_efpnorm(t)` (green = RMSNorm worse at
+that instant, red = EFPNorm worse). If a real effect were being masked by cancellation in the
+population mean, individual molecules would still show a consistently-signed or growing
+difference. Instead, most lines oscillate around zero and flip sign repeatedly within a single
+trajectory — the qdpi strained-set signal looks like noise, not a hidden systematic effect, at
+this timescale (2.5 ps).
 
 ### NVE MD Stability — AIMNet2 val (2.5 ps, 300 K, 0.5 fs, seed 42)
 
@@ -275,6 +319,24 @@ Results saved in `eval/md_runs/comparison_aimnet2_full200.json`.
 - EFPNorm also has tail failures (5 molecules where efp is >10 meV worse than rms), so neither
   model is unconditionally more stable — efpnorm simply fails less catastrophically on average.
 
+### NVE MD Stability — AIMNet2 20 ps long-duration pilot (in progress)
+
+The QDPi analysis above (2.5 ps) shows a flat drift plateau and noise-like per-molecule
+differences, but the paper this hypothesis is compared against (eSEN) runs 100 ps NVE MD — 40×
+longer. To check whether 2.5 ps is simply too short to see a real accumulating instability, we're
+running a 20 ps (40,000-step) pilot (`eval/run_md_longpilot.py`) on 8 AIMNet2 L4C128 val molecules,
+stratified from the 200-molecule sweep above:
+
+- 3 molecules where RMSNorm was worse at 2.5 ps (mol 39411, 253132, 223835 — the strongest existing
+  evidence for EFPNorm, including the 240 meV/atom outlier)
+- 3 molecules where EFPNorm was worse at 2.5 ps (mol 357430, 244658, 146045 — a symmetric control
+  against motivated reasoning)
+- 2 near-zero-gap "typical" molecules (mol 414475, 212470) as a baseline
+
+Unlike the QDPi strained set, these 8 molecules were selected *because* they already showed large,
+non-noisy 2.5 ps gaps — this is the more direct test of the timescale hypothesis. Results not yet
+in; will update with a paired drift-vs-time plot (as above) once complete.
+
 ---
 
 ## Evaluation
@@ -324,8 +386,15 @@ efpnorm-esen/
 │   └── pretrain.py             # from-scratch training, EFPNorm/RMSNorm switch
 └── eval/
     ├── run_md.py               # NVE MD evaluation + energy drift metric
-    ├── run_md_compare.py       # paired efpnorm vs rmsnorm comparison across molecules
-    └── rank_md_candidates.py   # rank val-set structures by DFT force norm
+    ├── run_md_compare.py       # paired efpnorm vs rmsnorm comparison across molecules (L4)
+    ├── run_md_compare_l6.py    # same, for L6 checkpoints
+    ├── run_md_longpilot.py     # long-duration (20+ ps) pilot on hand-picked outlier molecules
+    ├── rank_md_candidates.py   # rank val-set structures by DFT force norm
+    ├── plot_drift_curves.py    # drift-vs-time overlay plot (per-molecule + mean), L4 vs L6
+    ├── plot_drift_diff.py      # paired per-molecule drift-difference-vs-time plot, L4 vs L6
+    ├── candidate_ranks/        # precomputed val-set candidate rankings (qdpi, aimnet2)
+    ├── figures/                # saved plots referenced in this README
+    └── logs/                   # raw stdout logs from MD comparison runs
 ```
 
 ---
