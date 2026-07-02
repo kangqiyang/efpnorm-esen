@@ -366,23 +366,55 @@ Results saved in `eval/md_runs/comparison_aimnet2_full200.json`.
 - EFPNorm also has tail failures (5 molecules where efp is >10 meV worse than rms), so neither
   model is unconditionally more stable — efpnorm simply fails less catastrophically on average.
 
-### NVE MD Stability — AIMNet2 20 ps long-duration pilot (in progress)
+### NVE MD Stability — AIMNet2 20 ps long-duration pilot
 
 The QDPi analysis above (2.5 ps) shows a flat drift plateau and noise-like per-molecule
 differences, but the paper this hypothesis is compared against (eSEN) runs 100 ps NVE MD — 40×
-longer. To check whether 2.5 ps is simply too short to see a real accumulating instability, we're
-running a 20 ps (40,000-step) pilot (`eval/run_md_longpilot.py`) on 8 AIMNet2 L4C128 val molecules,
-stratified from the 200-molecule sweep above:
+longer. To check whether 2.5 ps is simply too short to see a real accumulating instability, we ran
+a 20 ps (40,000-step) pilot (`eval/run_md_longpilot.py`) on 8 AIMNet2 L4C128 val molecules,
+stratified from the 200-molecule sweep above — 3 where RMSNorm was worse at 2.5 ps (mol 39411,
+253132, 223835, including the 240 meV/atom outlier), 3 where EFPNorm was worse (mol 357430, 244658,
+146045), and 2 near-zero-gap "typical" molecules (mol 414475, 212470) as a baseline. Unlike the
+QDPi strained set, these were selected *because* they already showed large, non-noisy 2.5 ps gaps —
+the more direct test of the timescale hypothesis.
 
-- 3 molecules where RMSNorm was worse at 2.5 ps (mol 39411, 253132, 223835 — the strongest existing
-  evidence for EFPNorm, including the 240 meV/atom outlier)
-- 3 molecules where EFPNorm was worse at 2.5 ps (mol 357430, 244658, 146045 — a symmetric control
-  against motivated reasoning)
-- 2 near-zero-gap "typical" molecules (mol 414475, 212470) as a baseline
+**Result: EFPNorm 4/8, RMSNorm 4/8 — an exact coin flip**, even on molecules hand-picked for having
+the largest gaps at 2.5 ps.
 
-Unlike the QDPi strained set, these 8 molecules were selected *because* they already showed large,
-non-noisy 2.5 ps gaps — this is the more direct test of the timescale hypothesis. Results not yet
-in; will update with a paired drift-vs-time plot (as above) once complete.
+| Molecule | Category | EFPNorm (meV/atom) | RMSNorm (meV/atom) | 2.5ps gap (rms−efp) | 20ps gap (rms−efp) |
+|----------|----------|---:|---:|---:|---:|
+| 39411 | rms-worse | 162.1 | 394.7 | +239.6 | +232.6 (flat) |
+| 253132 | rms-worse | 39.0 | 45.6 | +29.0 | +6.6 (shrank) |
+| 223835 | rms-worse | 27.1 | 25.1 | +20.3 | −2.0 (flipped) |
+| 357430 | efp-worse | 31.9 | 33.3 | −30.9 | +1.4 (flipped) |
+| 244658 | efp-worse | 23.0 | 1.2 | −21.7 | −21.8 (flat) |
+| 146045 | efp-worse | 241.9 | 492.3 (**failed**, temp blow-up @ step 39,800) | −20.5 | +250.5 (grew, flipped) |
+| 414475 | typical | 8.5 | 4.4 | +0.2 | −4.1 (emerged) |
+| 212470 | typical | 42.8 | 5.3 | +0.4 | −37.5 (emerged) |
+
+![Drift vs time, 20 ps pilot](eval/figures/longpilot_drift_vs_time.png)
+![2.5 ps gap vs 20 ps gap](eval/figures/longpilot_gap_change.png)
+
+**Interpretation:**
+
+- **Final tally is a dead heat (4/8 each)**, despite deliberately selecting the molecules with the
+  strongest 2.5 ps signal. If EFPNorm's gradient-preservation mechanism produced a real,
+  accumulating stability advantage, extending duration on these specific outliers should have
+  reinforced it, not erased it.
+- **Gaps mostly shrink or flip sign with duration, not grow.** Only mol 39411 keeps a large, stable
+  gap; 253132's shrinks 4.4×; 223835 and 357430 flip sign entirely. This looks like 2.5 ps gaps
+  regressing toward noise at longer duration, not real instability that needed more time to show up.
+- **The two "typical" control molecules are the most interesting result here**: both had a
+  near-zero gap at 2.5 ps (as designed — they were picked as boring controls) but developed
+  substantial gaps by 20 ps (−4.1 and −37.5 meV/atom), both favoring RMSNorm. So duration *does*
+  reveal new instability sometimes — it's just idiosyncratic to the specific molecule/trajectory,
+  not systematically favoring either norm scheme (consistent with the blow-up investigation:
+  molecule 146045's failure traces to a real bond-dissociation event predicted almost identically
+  by both norm variants, that only RMSNorm happened to cross the abort threshold on by the very
+  last step — chaotic sensitivity, not a systematic stability difference).
+- **Bottom line**: extending duration 8× does not rescue the EFPNorm hypothesis — if anything it
+  further weakens it, closing the "maybe 2.5 ps was just too short" line of argument opened earlier
+  in this investigation.
 
 ---
 
@@ -439,6 +471,7 @@ efpnorm-esen/
     ├── rank_md_candidates.py   # rank val-set structures by DFT force norm
     ├── plot_drift_curves.py    # drift-vs-time overlay plot (per-molecule + mean), L4 vs L6
     ├── plot_drift_diff.py      # paired per-molecule drift-difference-vs-time plot, L4 vs L6
+    ├── plot_longpilot_results.py  # drift-vs-time + gap-change plots for the 20 ps pilot
     ├── probe_norm_gradients.py # direct mechanism probe: per-layer activation energy + gradient ratio
     ├── candidate_ranks/        # precomputed val-set candidate rankings (qdpi, aimnet2)
     ├── figures/                # saved plots referenced in this README

@@ -22,22 +22,28 @@ _PYTHON = "/nethome/kyang394/scratch/envs/MLFF/bin/python"
 _RUN_MD = str(_ROOT / "eval" / "run_md.py")
 
 CHECKPOINTS = {
-    "efpnorm": str(_ROOT / "train/checkpoints/qdpi_L4C128_efpnorm_lr4e-4"),
-    "rmsnorm": str(_ROOT / "train/checkpoints/qdpi_L4C128_rmsnorm_lr4e-4"),
+    "qdpi": {
+        "efpnorm": str(_ROOT / "train/checkpoints/qdpi_L4C128_efpnorm_lr4e-4"),
+        "rmsnorm": str(_ROOT / "train/checkpoints/qdpi_L4C128_rmsnorm_lr4e-4"),
+    },
+    "aimnet2": {
+        "efpnorm": str(_ROOT / "train/checkpoints/aimnet2_L4C128_efpnorm_lr4e-4"),
+        "rmsnorm": str(_ROOT / "train/checkpoints/aimnet2_L4C128_rmsnorm_lr4e-4"),
+    },
 }
 
 
-def out_dir_name(label, idx, steps, timestep, temperature):
-    run_name = f"qdpi_L4C128_{label}_lr4e-4"
+def out_dir_name(dataset, label, idx, steps, timestep, temperature):
+    run_name = f"{dataset}_L4C128_{label}_lr4e-4"
     return (f"{run_name}_val_s{idx}"
             f"_T{int(temperature)}_dt{timestep}_N{steps}_seed42")
 
 
-def run_batch(label, ckpt, device, indices, steps, timestep, temperature, skip_existing=False):
+def run_batch(label, ckpt, device, indices, steps, timestep, temperature, dataset, skip_existing=False):
     """Run run_md.py sequentially for each molecule index. Returns list of out dirs."""
     out_dirs = []
     for idx in indices:
-        tag = out_dir_name(label, idx, steps, timestep, temperature)
+        tag = out_dir_name(dataset, label, idx, steps, timestep, temperature)
         out_dir = _ROOT / "eval" / "md_runs" / tag
         out_dirs.append(out_dir)
 
@@ -48,7 +54,7 @@ def run_batch(label, ckpt, device, indices, steps, timestep, temperature, skip_e
         cmd = [
             _PYTHON, _RUN_MD,
             "--checkpoint_dir", ckpt,
-            "--dataset", "qdpi",
+            "--dataset", dataset,
             "--split", "val",
             "--sample_idx", str(idx),
             "--temperature", str(temperature),
@@ -87,6 +93,8 @@ def run_batch(label, ckpt, device, indices, steps, timestep, temperature, skip_e
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", default="qdpi", choices=list(CHECKPOINTS),
+                        help="Which pretrained model pair to compare")
     parser.add_argument("--device0", default="cuda:0", help="GPU for efpnorm")
     parser.add_argument("--device1", default="cuda:1", help="GPU for rmsnorm")
     parser.add_argument("--steps", type=int, default=5000)
@@ -95,16 +103,17 @@ def main():
     parser.add_argument("--sample_indices", type=int, nargs="+",
                         default=[0, 1, 2, 6, 10, 12])
     parser.add_argument("--out_json", default=None,
-                        help="Path for combined comparison JSON (default: md_runs/comparison_summary.json)")
+                        help="Path for combined comparison JSON (default: md_runs/comparison_<dataset>.json)")
     parser.add_argument("--skip_existing", action="store_true",
                         help="Skip molecules that already have a summary.json")
     args = parser.parse_args()
 
     indices = args.sample_indices
     ps = args.steps * args.timestep / 1000
+    ckpts = CHECKPOINTS[args.dataset]
 
     print(f"\n{'='*70}")
-    print(f"  MD stability comparison: efpnorm vs rmsnorm")
+    print(f"  MD stability comparison: efpnorm vs rmsnorm  (dataset={args.dataset})")
     print(f"  Steps={args.steps} × dt={args.timestep} fs = {ps:.2f} ps  T={args.temperature} K")
     print(f"  Molecules (val DB idx): {indices}")
     print(f"  efpnorm → {args.device0}  |  rmsnorm → {args.device1}")
@@ -117,15 +126,17 @@ def main():
     rms_dirs = []
 
     def run_efp():
-        efp_dirs.extend(run_batch("efpnorm", CHECKPOINTS["efpnorm"],
+        efp_dirs.extend(run_batch("efpnorm", ckpts["efpnorm"],
                                   args.device0, indices,
                                   args.steps, args.timestep, args.temperature,
+                                  dataset=args.dataset,
                                   skip_existing=args.skip_existing))
 
     def run_rms():
-        rms_dirs.extend(run_batch("rmsnorm", CHECKPOINTS["rmsnorm"],
+        rms_dirs.extend(run_batch("rmsnorm", ckpts["rmsnorm"],
                                   args.device1, indices,
                                   args.steps, args.timestep, args.temperature,
+                                  dataset=args.dataset,
                                   skip_existing=args.skip_existing))
 
     t_efp = threading.Thread(target=run_efp)
@@ -137,7 +148,7 @@ def main():
 
     # Load all summaries
     def load_summary(label, idx):
-        tag = out_dir_name(label, idx, args.steps, args.timestep, args.temperature)
+        tag = out_dir_name(args.dataset, label, idx, args.steps, args.timestep, args.temperature)
         p = _ROOT / "eval" / "md_runs" / tag / "summary.json"
         if p.exists():
             with open(p) as f:
@@ -181,7 +192,7 @@ def main():
     print(f"{'='*70}\n")
 
     # Save combined summary
-    combined_path = Path(args.out_json) if args.out_json else _ROOT / "eval" / "md_runs" / "comparison_summary.json"
+    combined_path = Path(args.out_json) if args.out_json else _ROOT / "eval" / "md_runs" / f"comparison_{args.dataset}.json"
     with open(combined_path, "w") as f:
         json.dump(all_results, f, indent=2)
     print(f"  Combined results saved: {combined_path}")
